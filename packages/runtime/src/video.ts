@@ -16,8 +16,10 @@ const HAVE_FUTURE_DATA = 3;
 const HAVE_ENOUGH_DATA = 4;
 
 // URL schemes the native decoder can stream directly from the filesystem.
-// Anything else (http/https/blob/data) is fetched fully into memory first.
 const FILE_SCHEMES = new Set(['romfs:', 'sdmc:', 'file:', 'nxjs:']);
+// Schemes the native decoder streams over the network with HTTP range
+// requests. Anything else (https/blob/data) is fetched fully into memory first.
+const STREAM_SCHEMES = new Set(['http:']);
 
 interface VideoInternal {
 	src: string;
@@ -409,7 +411,9 @@ export class Video extends EventTarget {
 		// honored — see note in `image.ts`.
 		const loadPromise = FILE_SCHEMES.has(url.protocol)
 			? $.videoLoad(handleOf(this), decodeURI(url.href), null)
-			: globalThis.fetch(url)
+			: STREAM_SCHEMES.has(url.protocol)
+				? $.videoLoad(handleOf(this), url.href, null)
+				: globalThis.fetch(url)
 					.then((res) => {
 						if (!res.ok) {
 							throw new Error(`Failed to load video: ${res.status}`);

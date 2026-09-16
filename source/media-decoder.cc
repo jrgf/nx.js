@@ -3,6 +3,7 @@
 // device runtime and the host nxjs-test binary.
 #include "media-decoder.h"
 #include "audio-graph.h"
+#include "http-reader.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -47,7 +48,7 @@ struct video_slot {
 } // namespace
 
 struct nx_media {
-	// ---- IO (file or memory) ----
+	// ---- IO (file, memory or http) ----
 	FILE *file = nullptr;
 	int64_t file_size = 0;
 	const uint8_t *mem = nullptr;
@@ -56,6 +57,8 @@ struct nx_media {
 	// Owns the memory buffer for the media's lifetime (the decode thread
 	// streams from it until destroy).
 	std::shared_ptr<void> mem_hold;
+	// HTTP range streaming for `http://` sources (read/seek re-request ranges).
+	nx_http_reader *http = nullptr;
 
 	// ---- ffmpeg ----
 	AVIOContext *avio = nullptr;
@@ -122,11 +125,19 @@ struct nx_media {
 namespace {
 
 // ---------------------------------------------------------------------------
-// Custom AVIO (stdio file or memory buffer)
+// Custom AVIO (stdio file, memory buffer or HTTP range reader)
 // ---------------------------------------------------------------------------
 
 int avio_read_cb(void *opaque, uint8_t *buf, int n) {
 	nx_media *m = static_cast<nx_media *>(opaque);
+	if (m->http) {
+		int r = nx_http_reader_read(m->http, buf, n);
+		if (r > 0)
+			return r;
+		if (r == 0)
+			return AVERROR_EOF;
+		return m->quit.load() ? AVERROR_EXIT : AVERROR(EIO);
+	}
 	if (m->file) {
 		size_t r = fread(buf, 1, (size_t)n, m->file);
 		return r > 0 ? (int)r : AVERROR_EOF;
@@ -143,8 +154,18 @@ int avio_read_cb(void *opaque, uint8_t *buf, int n) {
 int64_t avio_seek_cb(void *opaque, int64_t offset, int whence) {
 	nx_media *m = static_cast<nx_media *>(opaque);
 	if (whence & AVSEEK_SIZE)
-		return m->file ? m->file_size : (int64_t)m->mem_size;
+		return m->file ? m->file_size
+		       : m->http ? nx_http_reader_size(m->http)
+		                 : (int64_t)m->mem_size;
 	whence &= ~AVSEEK_FORCE;
+	if (m->http) {
+		int64_t size = nx_http_reader_size(m->http);
+		int64_t base = whence == SEEK_CUR   ? nx_http_reader_pos(m->http)
+		               : whence == SEEK_END ? size
+		                                    : 0;
+		int64_t pos = base + offset;
+		return nx_http_reader_seek(m->http, pos) ? pos : -1;
+	}
 	if (m->file) {
 		if (fseek(m->file, (long)offset, whence) != 0)
 			return -1;
@@ -487,7 +508,12 @@ nx_media_t *nx_media_open(const char *path, const uint8_t *mem,
 	const AVCodec *acodec = NULL;
 	unsigned char *avio_buf = NULL;
 
-	if (path) {
+	if (path && strncmp(path, "http://", 7) == 0) {
+		m->http = nx_http_reader_open(path, &m->quit, errbuf, errbuf_size);
+		if (!m->http)
+			goto fail;
+		m->file_size = nx_http_reader_size(m->http);
+	} else if (path) {
 		m->file = fopen(path, "rb");
 		if (!m->file) {
 			snprintf(errbuf, errbuf_size, "failed to open file");
@@ -974,5 +1000,7 @@ void nx_media_destroy(nx_media_t *m) {
 		free(m->slots[i].bgra);
 	if (m->file)
 		fclose(m->file);
+	if (m->http)
+		nx_http_reader_close(m->http);
 	delete m;
 }

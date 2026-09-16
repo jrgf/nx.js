@@ -68,6 +68,7 @@ set(NX_SOURCES
   ${NX_SOURCE_DIR}/fs.cc
   ${NX_SOURCE_DIR}/image.cc
   ${NX_SOURCE_DIR}/media-decoder.cc
+    ${NX_SOURCE_DIR}/http-reader.cc
   ${NX_SOURCE_DIR}/module.cc
   ${NX_SOURCE_DIR}/path2d.cc
   ${NX_SOURCE_DIR}/tcp.cc
