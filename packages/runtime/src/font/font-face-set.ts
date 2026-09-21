@@ -116,6 +116,10 @@ export function findFont(
 }
 
 export function addSystemFont(fonts: FontFaceSet): FontFace {
+	// A missing weight/style falls back to the already loaded system face.
+	for (const font of fonts) {
+		if (font.family === 'system-ui') return font;
+	}
 	const data = $.getSystemFont(0 /* PlSharedFontType_Standard */);
 	const f = new FontFace('system-ui', data);
 	fonts.add(f);
@@ -124,6 +128,9 @@ export function addSystemFont(fonts: FontFaceSet): FontFace {
 }
 
 export function addIconFont(fonts: FontFaceSet): FontFace {
+	for (const font of fonts) {
+		if (font.family === 'system-icons') return font;
+	}
 	const data = $.getSystemFont(5 /* PlSharedFontType_NintendoExt */);
 	const f = new FontFace('system-icons', data);
 	fonts.add(f);

@@ -8,6 +8,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -49,11 +50,23 @@ namespace {
 
 bool aborted(nx_http_reader *r) { return r->abort && r->abort->load(); }
 
+// Diagnostics go to stderr (the runtime's debug log on device).
+void http_log(const char *fmt, ...) {
+	va_list ap;
+	va_start(ap, fmt);
+	fprintf(stderr, "[http] ");
+	vfprintf(stderr, fmt, ap);
+	fputc('\n', stderr);
+	va_end(ap);
+	fflush(stderr);
+}
+
 void set_err(nx_http_reader *r, const char *what, int err) {
 	if (err)
 		snprintf(r->err, sizeof(r->err), "%s: %s", what, strerror(err));
 	else
 		snprintf(r->err, sizeof(r->err), "%s", what);
+	http_log("error at pos %lld: %s", (long long)r->pos, r->err);
 }
 
 void close_conn(nx_http_reader *r) {
@@ -303,6 +316,9 @@ bool open_range(nx_http_reader *r) {
 	}
 	if ((int64_t)r->pending.size() > r->remaining)
 		r->pending.resize((size_t)r->remaining);
+	http_log("range from %lld: size %lld, body %lld, %zu bytes with head",
+	         (long long)r->pos, (long long)r->size, (long long)r->remaining,
+	         r->pending.size());
 	if (r->remaining == 0)
 		close_conn(r);
 	return true;
@@ -355,6 +371,8 @@ int nx_http_reader_read(nx_http_reader *r, uint8_t *buf, int n) {
 			return -1;
 		}
 		if (got == 0) {
+			http_log("peer closed with %lld body bytes outstanding",
+			         (long long)r->remaining);
 			set_err(r, "connection closed mid-body", 0);
 			close_conn(r);
 			return -1;
@@ -373,6 +391,11 @@ bool nx_http_reader_seek(nx_http_reader *r, int64_t pos) {
 	if (pos == r->pos)
 		return true;
 	int64_t ahead = pos - r->pos;
+	http_log("seek %lld -> %lld (%s)", (long long)r->pos, (long long)pos,
+	         r->fd >= 0 && ahead > 0 && ahead <= SKIP_FORWARD_MAX &&
+	                 ahead <= r->remaining
+	             ? "read-through"
+	             : "reconnect");
 	if (r->fd >= 0 && ahead > 0 && ahead <= SKIP_FORWARD_MAX &&
 	    ahead <= r->remaining) {
 		uint8_t scratch[16384];

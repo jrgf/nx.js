@@ -4,6 +4,7 @@
 #include "media-decoder.h"
 #include "audio-graph.h"
 #include "http-reader.h"
+#include "media-source.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -59,6 +60,9 @@ struct nx_media {
 	std::shared_ptr<void> mem_hold;
 	// HTTP range streaming for `http://` sources (read/seek re-request ranges).
 	nx_http_reader *http = nullptr;
+	// In-process byte source (app pushes bytes; decoder blocks until present).
+	nx_media_source *source = nullptr;
+	int64_t source_pos = 0;
 
 	// ---- ffmpeg ----
 	AVIOContext *avio = nullptr;
@@ -130,6 +134,16 @@ namespace {
 
 int avio_read_cb(void *opaque, uint8_t *buf, int n) {
 	nx_media *m = static_cast<nx_media *>(opaque);
+	if (m->source) {
+		int r = nx_media_source_read(m->source, m->source_pos, buf, n);
+		if (r > 0) {
+			m->source_pos += r;
+			return r;
+		}
+		if (r == 0)
+			return AVERROR_EOF;
+		return AVERROR_EXIT;
+	}
 	if (m->http) {
 		int r = nx_http_reader_read(m->http, buf, n);
 		if (r > 0)
@@ -155,9 +169,21 @@ int64_t avio_seek_cb(void *opaque, int64_t offset, int whence) {
 	nx_media *m = static_cast<nx_media *>(opaque);
 	if (whence & AVSEEK_SIZE)
 		return m->file ? m->file_size
+		       : m->source ? nx_media_source_size(m->source)
 		       : m->http ? nx_http_reader_size(m->http)
 		                 : (int64_t)m->mem_size;
 	whence &= ~AVSEEK_FORCE;
+	if (m->source) {
+		int64_t sz = nx_media_source_size(m->source);
+		int64_t base = whence == SEEK_CUR   ? m->source_pos
+		               : whence == SEEK_END ? sz
+		                                    : 0;
+		int64_t pos = base + offset;
+		if (pos < 0 || pos > sz)
+			return -1;
+		m->source_pos = pos;
+		return pos;
+	}
 	if (m->http) {
 		int64_t size = nx_http_reader_size(m->http);
 		int64_t base = whence == SEEK_CUR   ? nx_http_reader_pos(m->http)
@@ -499,16 +525,20 @@ double clock_now(nx_media *m) {
 // ---------------------------------------------------------------------------
 
 nx_media_t *nx_media_open(const char *path, const uint8_t *mem,
-                          size_t mem_size, std::shared_ptr<void> keepalive,
-                          char *errbuf, size_t errbuf_size) {
+                          size_t mem_size, nx_media_source *source,
+                          std::shared_ptr<void> keepalive, char *errbuf,
+                          size_t errbuf_size) {
 	nx_media *m = new nx_media();
 	m->mem_hold = std::move(keepalive);
+	m->source = source;
 	int ret = 0;
 	const AVCodec *vcodec = NULL;
 	const AVCodec *acodec = NULL;
 	unsigned char *avio_buf = NULL;
 
-	if (path && strncmp(path, "http://", 7) == 0) {
+	if (source) {
+		m->file_size = nx_media_source_size(source);
+	} else if (path && strncmp(path, "http://", 7) == 0) {
 		m->http = nx_http_reader_open(path, &m->quit, errbuf, errbuf_size);
 		if (!m->http)
 			goto fail;

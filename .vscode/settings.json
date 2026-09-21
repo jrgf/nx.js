@@ -25,5 +25,6 @@
         "entropy.h": "c",
         "stdbool.h": "c"
     },
-    "typescript.tsdk": "node_modules/typescript/lib"
+    "typescript.tsdk": "node_modules/typescript/lib",
+    "cmake.sourceDirectory": "/Users/rafa/Desktop/nx.js/packages/runtime/test"
 }

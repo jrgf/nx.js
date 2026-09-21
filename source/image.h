@@ -35,7 +35,18 @@ typedef struct {
 	bool data_needs_js_free; // (legacy flag; now always malloc/free or tjFree)
 	enum ImageFormat format;
 	void *cached_sk_image; // sk_sp<SkImage>* — lazily built in canvas.cc
+	size_t accounted; // bytes reported to V8 as external memory (0 if none)
+	// Streaming images (video frames) change every frame. On a GPU canvas they
+	// are uploaded into ONE persistent texture (`gpu_surface`, an
+	// sk_sp<SkSurface>*) instead of being copied into a fresh SkImage per
+	// frame; `gpu_dirty` marks that the pixels changed since the last upload.
+	bool streaming;
+	bool gpu_dirty;
+	void *gpu_surface;
 } nx_image_t;
+
+// Release the persistent GPU surface (canvas.cc); safe to call without one.
+void nx_image_release_gpu(nx_image_t *image);
 
 // Release an image's cached SkImage (if any). Defined in canvas.cc where the
 // Skia type is available; called from image.cc's close_image.

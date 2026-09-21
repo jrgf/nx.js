@@ -119,57 +119,11 @@ void nx_udp_new(const FunctionCallbackInfo<Value> &info) {
 	info.GetReturnValue().Set(obj);
 }
 
-// One-shot sendto: a transient uv_poll_t for writability.
-struct sendto_t {
-	uv_poll_t poll;
-	Isolate *iso;
-	int fd;
-	Global<Function> callback;
-	Global<Value> buffer;
-	uint8_t *buf;
-	size_t buf_size;
-	struct sockaddr_in dest;
-};
-
-void sendto_finish(sendto_t *op, Local<Value> err, Local<Value> value) {
-	Isolate *iso = op->iso;
-	Local<Context> context = iso->GetCurrentContext();
-	Local<Function> cb = op->callback.Get(iso);
-	Local<Value> args[] = {err, value};
-	uv_poll_stop(&op->poll);
-	TryCatch try_catch(iso);
-	Local<Value> ret;
-	if (!cb->Call(context, Null(iso), 2, args).ToLocal(&ret)) {
-		nx_emit_error_event(iso, &try_catch);
-	}
-	op->callback.Reset();
-	op->buffer.Reset();
-	uv_close((uv_handle_t *)&op->poll,
-	         [](uv_handle_t *h) { delete static_cast<sendto_t *>(h->data); });
-}
-
-void sendto_cb(uv_poll_t *handle, int status, int events) {
-	sendto_t *op = static_cast<sendto_t *>(handle->data);
-	Isolate *iso = op->iso;
-	HandleScope scope(iso);
-	Context::Scope cs(iso->GetCurrentContext());
-	if (status < 0) {
-		sendto_finish(op, Exception::Error(nx_str(iso, uv_strerror(status))),
-		              Undefined(iso));
-		return;
-	}
-	ssize_t n = sendto(op->fd, op->buf, op->buf_size, 0,
-	                   (struct sockaddr *)&op->dest, sizeof(op->dest));
-	if (n < 0) {
-		if (errno == EAGAIN || errno == EWOULDBLOCK)
-			return;
-		sendto_finish(op, Exception::Error(nx_str(iso, strerror(errno))),
-		              Undefined(iso));
-		return;
-	}
-	sendto_finish(op, Undefined(iso), Integer::New(iso, (int)n));
-}
-
+// Datagram send. UDP is non-blocking and effectively immediate, so send
+// inline and call back synchronously. A separate uv_poll_t on this fd (as the
+// old code used) collides with the recv poll libuv already keeps for the bound
+// socket — libuv allows only one uv_poll_t per fd — which Data Aborts on the
+// Switch. See nx.js UDP crash on device (sendto_cb).
 void nx_udp_send(const FunctionCallbackInfo<Value> &info) {
 	Isolate *iso = info.GetIsolate();
 	Local<Context> context = iso->GetCurrentContext();
@@ -191,17 +145,20 @@ void nx_udp_send(const FunctionCallbackInfo<Value> &info) {
 		nx_throw(iso, "invalid IP address");
 		return;
 	}
-	sendto_t *op = new sendto_t();
-	op->iso = iso;
-	op->fd = fd;
-	op->callback.Reset(iso, cb);
-	op->buffer.Reset(iso, info[2]);
-	op->buf = buf;
-	op->buf_size = size;
-	op->dest = dest;
-	uv_poll_init_socket(nx_ctx(iso)->loop, &op->poll, fd);
-	op->poll.data = op;
-	uv_poll_start(&op->poll, UV_WRITABLE, sendto_cb);
+	Local<Value> err = Undefined(iso);
+	Local<Value> value = Undefined(iso);
+	ssize_t n = sendto(fd, buf, size, 0, (struct sockaddr *)&dest, sizeof(dest));
+	if (n < 0) {
+		err = Exception::Error(nx_str(iso, strerror(errno)));
+	} else {
+		value = Integer::New(iso, (int)n);
+	}
+	Local<Value> args[] = {err, value};
+	TryCatch try_catch(iso);
+	Local<Value> ret;
+	if (!cb->Call(context, Null(iso), 2, args).ToLocal(&ret)) {
+		nx_emit_error_event(iso, &try_catch);
+	}
 }
 
 void nx_dgram_close(const FunctionCallbackInfo<Value> &info) {

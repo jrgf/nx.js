@@ -39,6 +39,10 @@
 #include "include/core/SkRect.h"
 #include "include/core/SkSurface.h"
 #include "include/core/SkPathUtils.h"
+#include "include/gpu/GpuTypes.h"
+#include "include/gpu/ganesh/GrDirectContext.h"
+#include "include/gpu/ganesh/SkSurfaceGanesh.h"
+#include "skia_gpu.h"
 #include "include/core/SkSamplingOptions.h"
 #include "include/core/SkStream.h"
 #include "include/core/SkTextBlob.h"
@@ -2319,6 +2323,45 @@ void nx_canvas_context_2d_draw_image(const FunctionCallbackInfo<Value> &info) {
 		// GPU-texture cache (full source re-upload every frame), and at ~10k
 		// tile draws/frame the per-call copy also OOMs the single-threaded GC.
 		//
+		// Streaming source (a video) onto a GPU canvas: keep one persistent
+		// GPU surface the size of the frame and upload the changed pixels
+		// into it, then draw its snapshot. The per-frame RasterFromPixmapCopy
+		// below would otherwise allocate a fresh 8 MB image + texture for
+		// every frame, and on this platform those pile up in native memory
+		// far faster than they are reclaimed.
+		if (img->streaming && cr->recordingContext()) {
+			GrDirectContext *gr = nx_skia_gpu_context();
+			sk_sp<SkSurface> *surf =
+			    static_cast<sk_sp<SkSurface> *>(img->gpu_surface);
+			if (surf && ((*surf)->width() != (int)img->width ||
+			             (*surf)->height() != (int)img->height)) {
+				delete surf;
+				surf = nullptr;
+				img->gpu_surface = nullptr;
+			}
+			SkImageInfo fi = SkImageInfo::Make(img->width, img->height,
+			                                   kBGRA_8888_SkColorType,
+			                                   kPremul_SkAlphaType);
+			if (!surf && gr) {
+				sk_sp<SkSurface> s =
+				    SkSurfaces::RenderTarget(gr, skgpu::Budgeted::kNo, fi);
+				if (s) {
+					surf = new sk_sp<SkSurface>(std::move(s));
+					img->gpu_surface = surf;
+					img->gpu_dirty = true;
+				}
+			}
+			if (surf) {
+				if (img->gpu_dirty) {
+					SkPixmap pm(fi, img->data, (size_t)img->width * 4);
+					(*surf)->writePixels(pm, 0, 0);
+					img->gpu_dirty = false;
+				}
+				image = (*surf)->makeImageSnapshot();
+				source_w = img->width;
+				source_h = img->height;
+			}
+		}
 		// We build the cached image with RasterFromPixmapCopy, which COPIES
 		// the pixels into a self-owned, immutable SkImage. An earlier version
 		// used RasterFromData(MakeWithoutCopy) to avoid the copy, but that
@@ -2327,7 +2370,7 @@ void nx_canvas_context_2d_draw_image(const FunctionCallbackInfo<Value> &info) {
 		// buffer aborted (SkRefCnt BRK). The copy happens ONCE (it's cached),
 		// so the cost is paid a single time per image, not per draw. Released
 		// in close_image via nx_image_release_cache.
-		if (!img->cached_sk_image) {
+		if (!image && !img->cached_sk_image) {
 			SkImageInfo ii = SkImageInfo::Make(img->width, img->height,
 			                                   kBGRA_8888_SkColorType,
 			                                   kPremul_SkAlphaType);
@@ -2341,9 +2384,11 @@ void nx_canvas_context_2d_draw_image(const FunctionCallbackInfo<Value> &info) {
 				return;
 			img->cached_sk_image = new sk_sp<SkImage>(std::move(cached));
 		}
-		image = *static_cast<sk_sp<SkImage> *>(img->cached_sk_image);
-		source_w = img->width;
-		source_h = img->height;
+		if (!image) {
+			image = *static_cast<sk_sp<SkImage> *>(img->cached_sk_image);
+			source_w = img->width;
+			source_h = img->height;
+		}
 	} else {
 		nx_canvas_t *canvas = nx_get_canvas(iso, info[0]);
 		if (!canvas) {
@@ -2724,9 +2769,20 @@ void nx_canvas_proto_to_data_url(const FunctionCallbackInfo<Value> &info) {
 // where the Skia type is visible; called from image.cc:close_image and
 // irs.cc (in-place pixel updates must drop the stale memo).
 void nx_image_release_cache(nx_image_t *image) {
-	if (image && image->cached_sk_image) {
+	if (!image)
+		return;
+	if (image->cached_sk_image) {
 		delete static_cast<sk_sp<SkImage> *>(image->cached_sk_image);
 		image->cached_sk_image = nullptr;
+	}
+	// The pixels changed: the persistent GPU surface needs a fresh upload.
+	image->gpu_dirty = true;
+}
+
+void nx_image_release_gpu(nx_image_t *image) {
+	if (image && image->gpu_surface) {
+		delete static_cast<sk_sp<SkSurface> *>(image->gpu_surface);
+		image->gpu_surface = nullptr;
 	}
 }
 

@@ -609,8 +609,9 @@ export interface Init {
 	webAppletGetMode(applet: any): string;
 
 	// tcp.c
-	connect(cb: Callback<number>, ip: string, port: number): void;
-	write(cb: Callback<number>, fd: number, data: ArrayBuffer): void;
+	/** Returns the connecting fd while the attempt is in flight (abort it with `close(fd)`), or -1 if it settled synchronously. */
+	connect(cb: Callback<number>, ip: string, port: number): number;
+	write(cb: Callback<number>, fd: number, data: BufferSource): void;
 	read(cb: Callback<number>, fd: number, buffer: ArrayBuffer): void;
 	close(fd: number): void;
 	tcpServerInit(c: any): void;
@@ -862,6 +863,14 @@ export interface Init {
 		ctx: AudioContextHandle,
 	): AudioNodeHandle | null;
 	videoClose(video: VideoHandle): void;
+	// media-source.cc — in-process byte source for Video (Switch.MediaSource)
+	mediaSourceNew(size: number): number;
+	mediaSourceProvide(id: number, offset: number, data: BufferSource): void;
+	mediaSourceWanted(id: number): number;
+	mediaSourcePosition(id: number): number;
+	mediaSourceBuffered(id: number, offset: number): number;
+	mediaSourceDiscardBefore(id: number, offset: number): void;
+	mediaSourceClose(id: number): void;
 
 	// (Uint8Array base64/hex methods are provided natively by V8 — no binding.)
 

@@ -24,6 +24,14 @@ void close_image(nx_image_t *image) {
 	// vs. freeing `data` below doesn't strictly matter since the cache owns its
 	// own copy, but release it up front to keep teardown tidy.
 	nx_image_release_cache(image);
+	nx_image_release_gpu(image);
+	if (image->accounted) {
+		// Runs on the isolate thread (explicit close or the GC weak callback).
+		Isolate *iso = Isolate::GetCurrent();
+		if (iso)
+			iso->AdjustAmountOfExternalAllocatedMemory(-(int64_t)image->accounted);
+		image->accounted = 0;
+	}
 	if (image->data) {
 		if (image->format == FORMAT_JPEG) {
 			tjFree(image->data);
@@ -158,6 +166,14 @@ MaybeLocal<Value> nx_decode_image_cb(Isolate *iso, nx_work_t *req) {
 	if (data->err_str) {
 		iso->ThrowException(Exception::Error(nx_str(iso, data->err_str)));
 		return MaybeLocal<Value>();
+	}
+	// Decoded pixels live outside the V8 heap. Report them so the collector
+	// runs when unreferenced images pile up, instead of the process running
+	// out of native memory with a tiny JS heap.
+	nx_image_t *image = data->image;
+	if (image->data && !image->accounted) {
+		image->accounted = (size_t)image->width * image->height * 4;
+		iso->AdjustAmountOfExternalAllocatedMemory((int64_t)image->accounted);
 	}
 	return Undefined(iso).As<Value>();
 }

@@ -16,7 +16,7 @@ const HAVE_FUTURE_DATA = 3;
 const HAVE_ENOUGH_DATA = 4;
 
 // URL schemes the native decoder can stream directly from the filesystem.
-const FILE_SCHEMES = new Set(['romfs:', 'sdmc:', 'file:', 'nxjs:']);
+const FILE_SCHEMES = new Set(['romfs:', 'sdmc:', 'file:', 'nxjs:', 'nxms:']);
 // Schemes the native decoder streams over the network with HTTP range
 // requests. Anything else (https/blob/data) is fetched fully into memory first.
 const STREAM_SCHEMES = new Set(['http:']);
