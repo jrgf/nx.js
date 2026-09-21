@@ -46,9 +46,15 @@ bool nx_media_decode_audio(const uint8_t *data, size_t size,
 // nx_media_destroy(), since the decode thread streams from it for the
 // media's whole lifetime. Blocking — call off the main thread. Returns NULL
 // and fills `errbuf` on failure.
+struct nx_media_source; // in-process byte source (media-source.h)
+
+// Exactly one of `path`, `mem`, or `source` selects the input. For `source`,
+// the caller retains ownership and must keep it alive until nx_media_destroy()
+// (the decode thread reads from it for the media's whole lifetime).
 nx_media_t *nx_media_open(const char *path, const uint8_t *mem,
-                          size_t mem_size, std::shared_ptr<void> keepalive,
-                          char *errbuf, size_t errbuf_size);
+                          size_t mem_size, nx_media_source *source,
+                          std::shared_ptr<void> keepalive, char *errbuf,
+                          size_t errbuf_size);
 
 // Metadata (valid after a successful open).
 int nx_media_width(nx_media_t *m);

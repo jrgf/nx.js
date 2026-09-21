@@ -17,6 +17,9 @@
 #include "error.h"
 #include "image.h"
 #include "media-decoder.h"
+#include "media-source.h"
+#include <map>
+#include <stdint.h>
 #include "util.h"
 #include "wrap.h"
 #include <stdlib.h>
@@ -30,12 +33,18 @@ struct nx_video_t {
 	// MUST be first: canvas.cc draws any wrapped object as an nx_image_t.
 	nx_image_t image;
 	nx_media_t *media = nullptr;
+	int source_id = 0; // registry id of the media source backing this video (0=none)
 	// Stream-source node owned by this video (released on close, AFTER the
 	// decode thread is joined). NULL when the media has no audio track or no
 	// audio context was attached.
 	nx_audio_node *audio_node = nullptr;
 	bool closed = false;
 };
+
+// Media-source registry (defined below, used by reset_media/load).
+void ms_addref(int id);
+void ms_release(int id);
+nx_media_source *ms_lookup(int id);
 
 // Tear down the current media (joins the decode thread) so the handle can be
 // reloaded with a new source. Safe to call with nothing loaded.
@@ -44,12 +53,18 @@ void reset_media(nx_video_t *v) {
 		nx_media_destroy(v->media); // joins the decode thread
 		v->media = nullptr;
 	}
+	if (v->source_id) {
+		ms_release(v->source_id); // safe now: decoder no longer reads it
+		v->source_id = 0;
+	}
 	if (v->audio_node) {
 		// Released strictly after the decode thread is gone.
 		nx_audio_node_release(v->audio_node);
 		v->audio_node = nullptr;
 	}
 	nx_image_release_cache(&v->image);
+	nx_image_release_cache(&v->image);
+	nx_image_release_gpu(&v->image);
 	free(v->image.data);
 	v->image.data = nullptr;
 	v->image.width = v->image.height = 0;
@@ -81,6 +96,32 @@ double arg_f64(const FunctionCallbackInfo<Value> &info, int i) {
 	return v;
 }
 
+struct ms_entry {
+	nx_media_source *src;
+	int refcount;
+};
+std::map<int, ms_entry> g_media_sources; // main-thread only
+int g_next_source_id = 1;
+
+nx_media_source *ms_lookup(int id) {
+	auto it = g_media_sources.find(id);
+	return it == g_media_sources.end() ? nullptr : it->second.src;
+}
+void ms_addref(int id) {
+	auto it = g_media_sources.find(id);
+	if (it != g_media_sources.end())
+		it->second.refcount++;
+}
+void ms_release(int id) {
+	auto it = g_media_sources.find(id);
+	if (it == g_media_sources.end())
+		return;
+	if (--it->second.refcount <= 0) {
+		nx_media_source_free(it->second.src);
+		g_media_sources.erase(it);
+	}
+}
+
 void nx_video_new(const FunctionCallbackInfo<Value> &info) {
 	Isolate *iso = info.GetIsolate();
 	Local<Object> obj = nx::NewWrapped(iso);
@@ -102,6 +143,8 @@ struct video_load_t {
 	char *path = nullptr;    // owned copy (file-backed load)
 	const uint8_t *mem = nullptr;
 	size_t mem_size = 0;
+	nx_media_source *source = nullptr;
+	int source_id = 0;
 	// Strong ref to the memory buffer for the duration of the open (and,
 	// via nx_media_open, handed to the media for its whole lifetime) — a
 	// concurrent reset/close on the main thread can never unpin it.
@@ -114,8 +157,8 @@ struct video_load_t {
 void video_load_work(nx_work_t *req) {
 	video_load_t *data = (video_load_t *)req->data;
 	data->media =
-	    nx_media_open(data->path, data->mem, data->mem_size, data->mem_store,
-	                  data->err_buf, sizeof(data->err_buf));
+	    nx_media_open(data->path, data->mem, data->mem_size, data->source,
+	                  data->mem_store, data->err_buf, sizeof(data->err_buf));
 }
 
 MaybeLocal<Value> video_load_after(Isolate *iso, nx_work_t *req) {
@@ -124,12 +167,16 @@ MaybeLocal<Value> video_load_after(Isolate *iso, nx_work_t *req) {
 	nx_video_t *v = data->video;
 	data->video_val.Reset();
 	if (!data->media) {
+		if (data->source_id)
+			ms_release(data->source_id);
 		iso->ThrowException(Exception::Error(nx_str_lossy(iso, data->err_buf)));
 		return MaybeLocal<Value>();
 	}
 	if (v->closed) {
 		// The video was closed while the open was in flight.
 		nx_media_destroy(data->media);
+		if (data->source_id)
+			ms_release(data->source_id);
 		iso->ThrowException(Exception::Error(nx_str(iso, "Video was closed")));
 		return MaybeLocal<Value>();
 	}
@@ -137,6 +184,7 @@ MaybeLocal<Value> video_load_after(Isolate *iso, nx_work_t *req) {
 	// wins — tear down whatever an earlier load installed.
 	reset_media(v);
 	v->media = data->media;
+	v->source_id = data->source_id; // transfer the addref taken at load time
 	int width = nx_media_width(data->media);
 	int height = nx_media_height(data->media);
 	if (nx_media_has_video(data->media)) {
@@ -153,6 +201,8 @@ MaybeLocal<Value> video_load_after(Isolate *iso, nx_work_t *req) {
 		v->image.width = (uint32_t)width;
 		v->image.height = (uint32_t)height;
 		v->image.data = buf;
+		v->image.streaming = true; // one persistent GPU texture, updated per frame
+		v->image.gpu_dirty = true;
 	}
 	Local<Object> result = Object::New(iso);
 	result->Set(context, nx_str(iso, "width"), Integer::New(iso, width))
@@ -189,8 +239,21 @@ void nx_video_load(const FunctionCallbackInfo<Value> &info) {
 	data->video_val.Reset(iso, info[0]);
 	if (info[1]->IsString()) {
 		String::Utf8Value path(iso, info[1]);
-		if (*path)
+		if (*path && strncmp(*path, "nxms:", 5) == 0) {
+			int id = atoi(*path + 5);
+			nx_media_source *src = ms_lookup(id);
+			if (!src) {
+				req->data_dtor(data);
+				delete req;
+				nx_throw(iso, "unknown media source");
+				return;
+			}
+			ms_addref(id);
+			data->source = src;
+			data->source_id = id;
+		} else if (*path) {
 			data->path = strdup(*path);
+		}
 	} else if (info[2]->IsArrayBuffer()) {
 		Local<ArrayBuffer> ab = info[2].As<ArrayBuffer>();
 		std::shared_ptr<BackingStore> bs = ab->GetBackingStore();
@@ -198,7 +261,7 @@ void nx_video_load(const FunctionCallbackInfo<Value> &info) {
 		data->mem_size = bs->ByteLength();
 		data->mem_store = std::move(bs);
 	}
-	if (!data->path && !data->mem) {
+	if (!data->path && !data->mem && !data->source) {
 		req->data_dtor(data);
 		delete req;
 		nx_throw(iso, "expected a path string or ArrayBuffer");
@@ -332,6 +395,95 @@ void nx_video_close(const FunctionCallbackInfo<Value> &info) {
 		close_video(v);
 }
 
+// ---------------------------------------------------------------------------
+// MediaSource: JS pushes bytes, a source-backed Video decodes them. See
+// media-source.{h,cc}. Registry + refcount live above (ms_lookup/addref/release).
+// ---------------------------------------------------------------------------
+
+int64_t arg_i64(const FunctionCallbackInfo<Value> &info, int i) {
+	double v = 0;
+	if (!info[i]->NumberValue(info.GetIsolate()->GetCurrentContext()).To(&v))
+		v = 0;
+	return (int64_t)v;
+}
+
+void nx_media_source_new_js(const FunctionCallbackInfo<Value> &info) {
+	Isolate *iso = info.GetIsolate();
+	int64_t size = arg_i64(info, 0);
+	if (size < 0)
+		size = 0;
+	int id = g_next_source_id++;
+	g_media_sources[id] = ms_entry{nx_media_source_new(size), 1};
+	info.GetReturnValue().Set(Integer::New(iso, id));
+}
+
+void nx_media_source_provide_js(const FunctionCallbackInfo<Value> &info) {
+	Isolate *iso = info.GetIsolate();
+	int id = 0;
+	if (!info[0]->Int32Value(iso->GetCurrentContext()).To(&id))
+		return;
+	nx_media_source *src = ms_lookup(id);
+	if (!src)
+		return;
+	int64_t offset = arg_i64(info, 1);
+	size_t len = 0;
+	uint8_t *data = NX_GetBufferSource(iso, &len, info[2]);
+	if (!data) {
+		nx_throw(iso, "expected ArrayBuffer");
+		return;
+	}
+	nx_media_source_provide(src, offset, data, len);
+}
+
+void nx_media_source_wanted_js(const FunctionCallbackInfo<Value> &info) {
+	Isolate *iso = info.GetIsolate();
+	int id = 0;
+	if (!info[0]->Int32Value(iso->GetCurrentContext()).To(&id))
+		return;
+	nx_media_source *src = ms_lookup(id);
+	info.GetReturnValue().Set(
+	    Number::New(iso, src ? (double)nx_media_source_wanted(src) : -1));
+}
+
+void nx_media_source_position_js(const FunctionCallbackInfo<Value> &info) {
+	Isolate *iso = info.GetIsolate();
+	int id = 0;
+	if (!info[0]->Int32Value(iso->GetCurrentContext()).To(&id))
+		return;
+	nx_media_source *src = ms_lookup(id);
+	info.GetReturnValue().Set(
+	    Number::New(iso, src ? (double)nx_media_source_position(src) : 0));
+}
+
+void nx_media_source_buffered_js(const FunctionCallbackInfo<Value> &info) {
+	Isolate *iso = info.GetIsolate();
+	int id = 0;
+	if (!info[0]->Int32Value(iso->GetCurrentContext()).To(&id))
+		return;
+	nx_media_source *src = ms_lookup(id);
+	info.GetReturnValue().Set(Number::New(
+	    iso, src ? (double)nx_media_source_buffered(src, arg_i64(info, 1)) : 0));
+}
+
+void nx_media_source_discard_before_js(const FunctionCallbackInfo<Value> &info) {
+	int id = 0;
+	if (!info[0]->Int32Value(info.GetIsolate()->GetCurrentContext()).To(&id))
+		return;
+	nx_media_source *src = ms_lookup(id);
+	if (src)
+		nx_media_source_discard_before(src, arg_i64(info, 1));
+}
+
+void nx_media_source_close_js(const FunctionCallbackInfo<Value> &info) {
+	int id = 0;
+	if (!info[0]->Int32Value(info.GetIsolate()->GetCurrentContext()).To(&id))
+		return;
+	nx_media_source *src = ms_lookup(id);
+	if (src)
+		nx_media_source_close(src); // wake a blocked decoder
+	ms_release(id);                 // drop the JS reference
+}
+
 } // namespace
 
 void nx_init_video(Isolate *iso, Local<Object> init_obj) {
@@ -345,4 +497,11 @@ void nx_init_video(Isolate *iso, Local<Object> init_obj) {
 	NX_SET_FUNC(init_obj, "videoState", nx_video_state);
 	NX_SET_FUNC(init_obj, "videoCreateAudioNode", nx_video_create_audio_node);
 	NX_SET_FUNC(init_obj, "videoClose", nx_video_close);
+	NX_SET_FUNC(init_obj, "mediaSourceNew", nx_media_source_new_js);
+	NX_SET_FUNC(init_obj, "mediaSourceProvide", nx_media_source_provide_js);
+	NX_SET_FUNC(init_obj, "mediaSourceWanted", nx_media_source_wanted_js);
+	NX_SET_FUNC(init_obj, "mediaSourcePosition", nx_media_source_position_js);
+	NX_SET_FUNC(init_obj, "mediaSourceBuffered", nx_media_source_buffered_js);
+	NX_SET_FUNC(init_obj, "mediaSourceDiscardBefore", nx_media_source_discard_before_js);
+	NX_SET_FUNC(init_obj, "mediaSourceClose", nx_media_source_close_js);
 }

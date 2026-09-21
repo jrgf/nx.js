@@ -29,6 +29,7 @@ export * from './ns';
 export * from './profile';
 export * from './savedata';
 export * from './service';
+export { MediaSource } from './media-source';
 export { Socket, Server };
 export { WebApplet, type WebAppletOptions } from '../web-applet';
 

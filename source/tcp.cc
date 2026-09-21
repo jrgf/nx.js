@@ -19,6 +19,15 @@ using namespace v8;
 namespace {
 
 // Set a socket non-blocking.
+void set_no_sigpipe(int fd) {
+#ifdef SO_NOSIGPIPE
+	int on = 1;
+	setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
+#else
+	(void)fd;
+#endif
+}
+
 void set_nonblocking(int fd) {
 	int flags = fcntl(fd, F_GETFL, 0);
 	if (flags >= 0)
@@ -327,6 +336,7 @@ void nx_tcp_connect(const FunctionCallbackInfo<Value> &info) {
 		return;
 	}
 	set_nonblocking(fd);
+	set_no_sigpipe(fd);
 	struct sockaddr_in addr;
 	memset(&addr, 0, sizeof(addr));
 	addr.sin_family = AF_INET;
@@ -336,16 +346,23 @@ void nx_tcp_connect(const FunctionCallbackInfo<Value> &info) {
 	if (r == 0) {
 		// Immediate success (rare).
 		call_now(iso, cb, Undefined(iso), Integer::New(iso, fd));
+		info.GetReturnValue().Set(-1);
 		return;
 	}
 	if (errno != EINPROGRESS) {
 		int e = errno;
 		close(fd);
 		call_now(iso, cb, make_errno(iso, e), Undefined(iso));
+		info.GetReturnValue().Set(-1);
 		return;
 	}
 	op_t *op = op_new(iso, fd, cb, UV_WRITABLE, connect_on_ready);
-	(void)op; // op_new throws + returns null on failure
+	if (!op) // op_new threw
+		return;
+	// The attempt is in flight: return its fd so JS can abort it with close()
+	// (a pending connect otherwise holds socket buffers until the stack's own
+	// timeout, and enough of them exhaust the pool with ENOBUFS).
+	info.GetReturnValue().Set(fd);
 }
 
 // ---- read ----
@@ -483,6 +500,7 @@ void server_poll_cb(uv_poll_t *handle, int status, int events) {
 	if (client_fd < 0)
 		return;
 	set_nonblocking(client_fd);
+	set_no_sigpipe(client_fd);
 	Local<Function> cb = s->callback.Get(iso);
 	Local<Value> args[] = {Integer::New(iso, client_fd)};
 	TryCatch try_catch(iso);

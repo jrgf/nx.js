@@ -31,8 +31,12 @@
 // Returns the surface the screen canvas should draw into, or nullptr on
 // failure (all partial EGL/Mesa state torn down). The surface is owned by
 // this module; do not outlive nx_skia_gpu_screen_exit().
+class GrDirectContext;
+
 sk_sp<SkSurface> nx_skia_gpu_screen_init(u32 width, u32 height, int samples,
                                          u32 gpu_cache_mib);
+// The live Ganesh context, or null when the screen is not GPU-backed.
+GrDirectContext *nx_skia_gpu_context(void);
 
 // Flush + submit the GPU surface and eglSwapBuffers (present one frame).
 void nx_skia_gpu_present(void);

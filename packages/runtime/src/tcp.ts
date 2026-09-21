@@ -26,13 +26,20 @@ export function parseAddress(address: string): SocketAddress {
 	};
 }
 
-export async function connect(opts: SocketAddress) {
+/**
+ * Resolve and connect. `onPending` receives the in-flight attempt's fd so the
+ * caller can abort it (with `$.close(fd)`) before it settles.
+ */
+export async function connect(opts: SocketAddress, onPending?: (fd: number) => void) {
 	const { hostname = '127.0.0.1', port } = opts;
 	const [ip] = await resolveDns(hostname);
 	if (!ip) {
 		throw new Error(`Could not resolve "${hostname}" to an IP address`);
 	}
-	return toPromise($.connect, ip, port);
+	return new Promise<number>((resolve, reject) => {
+		const pending = $.connect((err, fd) => (err ? reject(err) : resolve(fd)), ip, port);
+		if (pending >= 0) onPending?.(pending);
+	});
 }
 
 function read(fd: number, buffer: BufferSource) {
@@ -40,9 +47,20 @@ function read(fd: number, buffer: BufferSource) {
 	return toPromise($.read, fd, ab);
 }
 
-function write(fd: number, data: BufferSource) {
+// The native write issues a single `send()` and reports how many bytes the
+// socket accepted, so keep writing until the whole chunk is on the wire.
+async function write(fd: number, data: BufferSource) {
 	const ab = bufferSourceToArrayBuffer(data);
-	return toPromise($.write, fd, ab);
+	let offset = 0;
+	while (offset < ab.byteLength) {
+		const n = await toPromise(
+			$.write,
+			fd,
+			offset === 0 ? ab : new Uint8Array(ab, offset),
+		);
+		if (n <= 0) throw new Error('socket write made no progress');
+		offset += n;
+	}
 }
 
 function tlsHandshake(
@@ -66,6 +84,7 @@ function tlsWrite(ctx: TlsContextOpaque, data: BufferSource) {
 interface SocketInternal {
 	fd: number;
 	tlsFd?: number; // fd transferred to the native TLS context (it owns/closes it)
+	pendingFd?: number; // fd of a connect still in flight (abortable via close())
 	tls?: TlsContextOpaque;
 	opened: PromiseWithResolvers<SocketInfo>;
 	closed: PromiseWithResolvers<void>;
@@ -177,8 +196,17 @@ export class Socket {
 			},
 		});
 
-		connect(address)
+		connect(address, (fd) => {
+			i.pendingFd = fd;
+		})
 			.then((fd) => {
+				i.pendingFd = undefined;
+				if (i.closing) {
+					// close() ran while the connect was still in flight: the fd
+					// arrives now and nobody else will ever close it.
+					$.close(fd);
+					throw new Error('socket closed before connecting');
+				}
 				i.fd = fd;
 				if (secureTransport === 'on') {
 					// Once we hand the fd to the TLS layer, the native TLS
@@ -218,12 +246,22 @@ export class Socket {
 		// Reject `opened` with the real reason FIRST, before cancelling the
 		// readable (whose cancel handler re-enters close()).
 		i.readBuffer = undefined; // release the large read buffer promptly
+		if (typeof i.pendingFd === 'number') {
+			// Abort a connect still in flight: drops the pending op and closes
+			// the fd once libuv lets go of it, releasing its socket buffers now
+			// instead of at the TCP stack's own (long) connect timeout.
+			$.close(i.pendingFd);
+			i.pendingFd = undefined;
+		}
 		i.opened.reject(reason);
+		// cancel()/abort() on a stream that already errored (e.g. a read that
+		// failed with ECONNRESET) reject with the stored error; nothing awaits
+		// them here, so swallow the rejection or it surfaces as fatal.
 		if (!this.readable.locked) {
-			this.readable.cancel(reason);
+			this.readable.cancel(reason).catch(() => {});
 		}
 		if (!this.writable.locked) {
-			this.writable.abort(reason);
+			this.writable.abort(reason).catch(() => {});
 		}
 		if (i.tls) {
 			// TLS context owns its fd; tear it down natively (closes the

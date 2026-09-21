@@ -30,6 +30,7 @@ EGLSurface s_surf = nullptr;
 EGLContext s_ctx = nullptr;
 
 sk_sp<GrDirectContext> s_gr;
+
 // The EGL window's FBO 0, double-buffered (the present target).
 sk_sp<SkSurface> s_fbo;
 // A persistent, single render-target surface the canvas draws into. Canvas 2D
@@ -86,6 +87,8 @@ bool init_egl(NWindow *win) {
 }
 
 } // namespace
+
+GrDirectContext *nx_skia_gpu_context(void) { return s_gr.get(); }
 
 sk_sp<SkSurface> nx_skia_gpu_screen_init(u32 width, u32 height, int samples,
                                          u32 gpu_cache_mib) {
